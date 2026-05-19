@@ -1,0 +1,15 @@
+[project]
+name = "replication-panel-paper"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "numpy",
+    "pandas",
+    "matplotlib",
+    "scipy",
+    "statsmodels",
+    "linearmodels",
+    "openpyxl>=3.1.5",
+]
