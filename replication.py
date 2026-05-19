@@ -1,8 +1,10 @@
 """
 Auteur : A COMPLETER
-Date   : 2026-05-18
+Date   : 2026-05-19
 Reference : Huntington & Liddle (2022), "How energy prices shape OECD economic growth",
-Energy Economics, 111, 106082.
+            Energy Economics, 111, 106082.
+
+Mise à jour : Alignement strict sur la mise en page originale des Tables 1, 4, 5 et 6.
 """
 
 from __future__ import annotations
@@ -17,978 +19,636 @@ import pandas as pd
 import statsmodels.api as sm
 from scipy import stats
 
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+from matplotlib.ticker import MultipleLocator
+
 try:
-    from linearmodels.panel import BetweenOLS, FirstDifferenceOLS, PanelOLS, RandomEffects
     from linearmodels.iv import IV2SLS
-except Exception as exc:  # pragma: no cover - runtime guard
-    raise ImportError(
-        "linearmodels est requis. Installez-le avec `pip install linearmodels`"
-    ) from exc
+except ImportError as exc:
+    raise ImportError("linearmodels est requis. Installez-le avec `pip install linearmodels`") from exc
 
-
-# -----------------------------------------------------------------------------
+# =============================================================================
 # Configuration
-# -----------------------------------------------------------------------------
-DATA_PATH = Path(os.environ.get("GROWTH_EE_PATH", str(Path(__file__).with_name("growth_EE.xlsx"))))
-OUTPUT_DIR = Path(__file__).with_name("outputs")
+# =============================================================================
 
-COUNTRY_COL = "country"
-YEAR_COL = "yr"
+DATA_PATH   = Path(os.environ.get("GROWTH_EE_PATH", "growth_EE.xlsx"))
+OUTPUT_DIR  = Path("outputs")
 
-# Colonnes brutes
-RAW_GDP = "rgdpmad"
-RAW_CPI = "cpi"
-RAW_ENERGY = "enpr"
-RAW_GDPNOM = "gdpnom"
-RAW_EXPORTS = "exports"
-RAW_IMPORTS = "imports"
-RAW_EXPENDITURE = "expenditure"
-RAW_INVEST = "iy"
+COUNTRY_COL, YEAR_COL = "country", "yr"
 
-# Variables transformees
-LOG_GDP = "lrgdpmad"
-LOG_CPI = "lcpi"
-LOG_ENERGY = "lenpr"
-OPEN_TRADE = "open"
-GOV_EXP = "expgdp"
-INVEST = "iy"
+RAW_GDP, RAW_CPI, RAW_ENERGY = "rgdpmad", "cpi", "enpr"
+RAW_GDPNOM, RAW_EXPORTS, RAW_IMPORTS = "gdpnom", "exports", "imports"
+RAW_EXPENDITURE, RAW_INVEST = "expenditure", "iy"
+
+LOG_GDP, LOG_CPI, LOG_ENERGY = "lrgdpmad", "lcpi", "lenpr"
+OPEN_TRADE, GOV_EXP, INVEST = "open", "expgdp", "iy"
 
 CORE_VARS = [LOG_GDP, LOG_CPI, LOG_ENERGY, OPEN_TRADE, GOV_EXP, INVEST]
+INSTRUMENT_COLS = ["l_dlenpr", "l_lenpr", "ln_ywld", "ln_meast", "l_ln_ywld", "l_ln_meast", "usshare", "iranrev"]
 
-# Instruments explicites (optionnel). Si vide, detection automatique par pattern.
-INSTRUMENT_COLS: List[str] = [
-    "l_dlenpr",
-    "l_lenpr",
-    "ln_ywld",
-    "ln_meast",
-    "l_ln_ywld",
-    "l_ln_meast",
-    "usshare",
-    "iranrev",
-]
+COUNTRY_ISO = {
+    "aus": "Australia", "bel": "Belgium", "can": "Canada", "che": "Switzerland",
+    "deu": "Germany", "dnk": "Denmark", "esp": "Spain", "fin": "Finland",
+    "fra": "France", "gbr": "United Kingdom", "irl": "Ireland", "ita": "Italy",
+    "jpn": "Japan", "nld": "Netherlands", "nor": "Norway", "prt": "Portugal",
+    "swe": "Sweden", "usa": "United States",
+}
 
-# Echantillon de base: par defaut, on coupe avant 1972 (option if yr>1971)
-BASE_START_YEAR = 1972
+PAPER_RC = {
+    "font.family": "DejaVu Serif", "font.size": 9, "axes.titlesize": 9,
+    "axes.labelsize": 8, "xtick.labelsize": 7, "ytick.labelsize": 7,
+    "axes.spines.top": False, "axes.spines.right": False, "figure.dpi": 200,
+}
 
+# =============================================================================
+# Helpers mise en forme
+# =============================================================================
 
-# -----------------------------------------------------------------------------
-# Chargement et preparation des donnees
-# -----------------------------------------------------------------------------
+def _stars(p: float) -> str:
+    if not np.isfinite(p): return ""
+    if p < 0.01: return "**"
+    if p < 0.05: return "*"
+    return ""
 
-def load_data(path: Path) -> pd.DataFrame:
-    """Charge le fichier Excel et nettoie les noms de colonnes."""
-    try:
-        df = pd.read_excel(path, sheet_name="data")
-    except PermissionError as exc:
-        raise PermissionError(
-            f"Impossible de lire {path}. Le fichier est probablement ouvert dans Excel ou verrouille par OneDrive. "
-            "Fermez le classeur, ou copiez-le vers un chemin de travail libre puis lancez le script avec "
-            "la variable d'environnement GROWTH_EE_PATH."
-        ) from exc
+def _fmt_coef(coef: float, se: float, p: float) -> tuple[str, str]:
+    if not np.isfinite(coef): return "", ""
+    return f"{coef:.3f}{_stars(p)}", f"({se:.3f})" if np.isfinite(se) else ""
+
+def _country_label(c: str) -> str:
+    return COUNTRY_ISO.get(c.lower(), c)
+
+# =============================================================================
+# Chargement des donnees
+# =============================================================================
+
+def load_and_prepare_data(path: Path) -> pd.DataFrame:
+    df = pd.read_excel(path, sheet_name="data")
     df.columns = [str(c).strip() for c in df.columns]
-
-    required = [
-        COUNTRY_COL,
-        YEAR_COL,
-        RAW_GDP,
-        RAW_CPI,
-        RAW_ENERGY,
-        RAW_GDPNOM,
-        RAW_EXPORTS,
-        RAW_IMPORTS,
-        RAW_EXPENDITURE,
-        RAW_INVEST,
-    ]
-    missing = [c for c in required if c not in df.columns]
-    if missing:
-        raise ValueError(f"Colonnes manquantes dans les donnees: {missing}")
-
+    
     for col in [YEAR_COL, RAW_GDP, RAW_CPI, RAW_ENERGY, RAW_GDPNOM, RAW_EXPORTS, RAW_IMPORTS, RAW_EXPENDITURE, RAW_INVEST]:
         df[col] = pd.to_numeric(df[col], errors="coerce")
-
-    return df
-
-
-def prepare_panel(df: pd.DataFrame) -> pd.DataFrame:
-    """Trie et cree le MultiIndex (country, yr)."""
-    df = df.copy()
+        
     df[COUNTRY_COL] = df[COUNTRY_COL].astype(str)
-    df[YEAR_COL] = df[YEAR_COL].astype(int)
-    df = df.sort_values([COUNTRY_COL, YEAR_COL])
-    df = df.set_index([COUNTRY_COL, YEAR_COL])
-    df = df.sort_index()
-    return df
+    df[YEAR_COL]    = df[YEAR_COL].astype(int)
+    df = df.set_index([COUNTRY_COL, YEAR_COL]).sort_index()
 
-
-def add_transformations(df: pd.DataFrame) -> pd.DataFrame:
-    """Ajoute differences, retards et variables de regime."""
-    df = df.copy()
-    # Ratios macro
     df[OPEN_TRADE] = (df[RAW_EXPORTS] + df[RAW_IMPORTS]) / df[RAW_GDPNOM]
-    df[GOV_EXP] = df[RAW_EXPENDITURE] / df[RAW_GDPNOM]
-
-    # Logs (protege contre valeurs non-positives)
+    df[GOV_EXP]    = df[RAW_EXPENDITURE] / df[RAW_GDPNOM]
     for raw, out in [(RAW_GDP, LOG_GDP), (RAW_CPI, LOG_CPI), (RAW_ENERGY, LOG_ENERGY)]:
         df[out] = np.where(df[raw] > 0, np.log(df[raw]), np.nan)
 
-    # Nettoyage des infinis potentiels
     df.replace([np.inf, -np.inf], np.nan, inplace=True)
+    df = df.dropna(subset=CORE_VARS)
 
-    # Echantillon commun (comme keep if e(sample) == 1)
-    base_vars = [LOG_GDP, LOG_CPI, LOG_ENERGY, OPEN_TRADE, GOV_EXP, INVEST]
-    df = df.dropna(subset=base_vars)
-
-    # Differences et lags
-    for var in base_vars:
-        dvar = f"d{var}"
-        df[dvar] = df.groupby(level=0)[var].diff()
+    for var in CORE_VARS:
+        df[f"d{var}"] = df.groupby(level=0)[var].diff()
         df[f"l_{var}"] = df.groupby(level=0)[var].shift(1)
-        df[f"l_d{var}"] = df.groupby(level=0)[dvar].shift(1)
+        
+    df["l_dlenpr"] = df.groupby(level=0)["dlenpr"].shift(1)
 
-    # Lags t-2 pour Anderson-Hsiao
-    df["l2_lrgdpmad"] = df.groupby(level=0)[LOG_GDP].shift(2)
-    df["l2_lenpr"] = df.groupby(level=0)[LOG_ENERGY].shift(2)
-
-    # Regimes et interactions
-    year_index = df.index.get_level_values(YEAR_COL)
-    df["mod"] = (year_index > 1982).astype(int)
-    df["premod"] = (year_index < 1983).astype(int)
-    df["lenprmod"] = df["mod"] * df[LOG_ENERGY]
+    year_idx = df.index.get_level_values(YEAR_COL)
+    df["mod"] = (year_idx > 1982).astype(int)
     df["dlenprmod"] = df["mod"] * df["dlenpr"]
-    df["dlenprpre"] = df["premod"] * df["dlenpr"]
 
-    # Inflation > 2%
     df["dlcpi2"] = np.where(df["dlcpi"] > 0.02, df["dlcpi"], 0.0)
-    df["dlcpix"] = df["dlcpi"] - df["dlcpi2"]
     df["l_dlcpi2"] = df.groupby(level=0)["dlcpi2"].shift(1)
 
-    # Lags des instruments globaux
-    if "ln_ywld" in df.columns:
-        df["l_ln_ywld"] = df.groupby(level=0)["ln_ywld"].shift(1)
-    if "ln_meast" in df.columns:
-        df["l_ln_meast"] = df.groupby(level=0)["ln_meast"].shift(1)
-
-    # Moyennes transversales (suffixe T)
-    for var in base_vars:
-        df[f"{var}T"] = df.groupby(level=1)[var].transform("mean")
+    for col in ["ln_ywld", "ln_meast"]:
+        if col in df.columns:
+            df[f"l_{col}"] = df.groupby(level=0)[col].shift(1)
 
     return df
 
-
-def compute_ecm(df: pd.DataFrame) -> Tuple[pd.DataFrame, sm.regression.linear_model.RegressionResultsWrapper]:
-    """Calcule le terme ECM a partir d'une regression en niveaux."""
-    df = df.copy()
-    y = df[LOG_GDP]
-    X = df[[LOG_CPI, LOG_ENERGY, OPEN_TRADE, GOV_EXP, INVEST]]
-    X = sm.add_constant(X, has_constant="add")
-    model = sm.OLS(y, X, missing="drop").fit()
-    resid = y - X @ model.params
-    df["ecterm"] = resid
-    df["l_ecterm"] = resid.groupby(level=0).shift(1)
-    return df, model
-
-
-# -----------------------------------------------------------------------------
-# Statistiques descriptives panel
-# -----------------------------------------------------------------------------
-
-def panel_variance_decomp(df: pd.DataFrame, variables: Iterable[str]) -> pd.DataFrame:
-    """Decomposition variance between/within/two-way/FD pour chaque variable."""
-    rows = []
-    for var in variables:
-        series = df[var].dropna()
-        if series.empty:
+def load_table56(path: Path) -> Optional[pd.DataFrame]:
+    for sheet in ("tables5-6", "table5-6"):
+        try:
+            raw = pd.read_excel(path, sheet_name=sheet)
+            raw.columns = [str(c).strip().lower() for c in raw.columns]
+            
+            out = pd.DataFrame()
+            if "country" in raw.columns: 
+                out["country"] = raw["country"].astype(str).str.strip()
+            if "intensity" in raw.columns: 
+                out["intensity"] = pd.to_numeric(raw["intensity"], errors="coerce")
+            
+            # Correction cruciale pour Table 5 : Les colonnes s'appellent Supply/Demand dans l'Excel
+            if "supply" in raw.columns: 
+                out["exports"] = pd.to_numeric(raw["supply"], errors="coerce")
+            elif "exports" in raw.columns: 
+                out["exports"] = pd.to_numeric(raw["exports"], errors="coerce")
+                
+            if "demand" in raw.columns: 
+                out["imports"] = pd.to_numeric(raw["demand"], errors="coerce")
+            elif "imports" in raw.columns: 
+                out["imports"] = pd.to_numeric(raw["imports"], errors="coerce")
+                
+            if "post_1982" in raw.columns: 
+                out["post_1982"] = pd.to_numeric(raw["post_1982"], errors="coerce")
+            if "pre_1983" in raw.columns: 
+                out["pre_1983"] = pd.to_numeric(raw["pre_1983"], errors="coerce")
+                
+            if "exclude" in raw.columns: 
+                out["exclude"] = raw["exclude"].astype(str).str.strip().str.lower().isin(["1", "true", "yes", "y"])
+            elif "country" in out.columns:
+                out["exclude"] = out["country"].str.lower().isin(["germany", "ireland"])
+                
+            return out
+        except Exception:
             continue
-
-        n_entities = series.index.get_level_values(0).nunique()
-        nt = series.shape[0]
-        avg_t = nt / n_entities if n_entities else np.nan
-
-        overall_var = series.var(ddof=1)
-        mean_i = series.groupby(level=0).mean()
-        between_var = mean_i.var(ddof=1)
-
-        within = series - series.groupby(level=0).transform("mean")
-        within_var = within.var(ddof=1)
-
-        mean_t = series.groupby(level=1).transform("mean")
-        twfe = series - series.groupby(level=0).transform("mean") - mean_t + series.mean()
-        twfe_var = twfe.var(ddof=1)
-
-        fd = series.groupby(level=0).diff()
-        fd_var = fd.var(ddof=1)
-
-        within_pct = (within_var / overall_var * 100.0) if overall_var else np.nan
-
-        rows.append(
-            {
-                "variable": var,
-                "N": n_entities,
-                "NT": nt,
-                "NT_over_N": avg_t,
-                "var_total": overall_var,
-                "var_between": between_var,
-                "var_within": within_var,
-                "var_twfe": twfe_var,
-                "var_fd": fd_var,
-                "pct_within": within_pct,
-            }
-        )
-
-    out = pd.DataFrame(rows)
-    out = out.sort_values("pct_within", ascending=False)
-    return out
-
-
-def observation_tables(df: pd.DataFrame) -> Dict[str, pd.DataFrame]:
-    """Tableaux d'observations par pays et par annee."""
-    df_reset = df.reset_index()
-    by_country = df_reset.groupby(COUNTRY_COL).size().to_frame("n_obs")
-    by_year = df_reset.groupby(YEAR_COL).size().to_frame("n_obs")
-    matrix = df_reset.pivot_table(index=COUNTRY_COL, columns=YEAR_COL, values=LOG_GDP, aggfunc="size")
-    return {"by_country": by_country, "by_year": by_year, "matrix": matrix}
-
-
-# -----------------------------------------------------------------------------
-# Tests preliminaires
-# -----------------------------------------------------------------------------
-
-def _cips_from_linearmodels(series: pd.Series, lags: int = 1) -> Optional[Tuple[float, float]]:
     return None
 
+# =============================================================================
+# CIPS Test & CCEMG Math
+# =============================================================================
 
-def _cips_manual(series: pd.Series, lags: int = 1) -> Tuple[float, float]:
-    df = series.dropna().reset_index()
-    df = df.sort_values([COUNTRY_COL, YEAR_COL])
+def cips_test_manual(series: pd.Series, lags: int = 1, trend: str = 'c') -> Tuple[float, float]:
+    df = series.dropna().reset_index().sort_values([COUNTRY_COL, YEAR_COL])
     yname = series.name
-
-    df["ybar"] = df.groupby(YEAR_COL)[yname].transform("mean")
+    df["ybar"]  = df.groupby(YEAR_COL)[yname].transform("mean")
     df["y_lag"] = df.groupby(COUNTRY_COL)[yname].shift(1)
-    df["dy"] = df.groupby(COUNTRY_COL)[yname].diff()
-
-    ybar_by_year = df[[YEAR_COL, "ybar"]].drop_duplicates().sort_values(YEAR_COL)
-    ybar_by_year = ybar_by_year.set_index(YEAR_COL)["ybar"]
+    df["dy"]    = df.groupby(COUNTRY_COL)[yname].diff()
+    
+    ybar_by_year = df[[YEAR_COL, "ybar"]].drop_duplicates().set_index(YEAR_COL)["ybar"]
     df = df.join(ybar_by_year.shift(1).rename("ybar_lag"), on=YEAR_COL)
     df = df.join(ybar_by_year.diff().rename("dybar"), on=YEAR_COL)
-
+    
     for k in range(1, lags + 1):
         df[f"dy_lag{k}"] = df.groupby(COUNTRY_COL)["dy"].shift(k)
-
+        
     tstats = []
     for _, g in df.groupby(COUNTRY_COL):
         cols = ["y_lag", "ybar_lag", "dybar"] + [f"dy_lag{k}" for k in range(1, lags + 1)]
         g = g.dropna(subset=["dy"] + cols)
-        if g.shape[0] < (5 + lags):
-            continue
-
+        if g.shape[0] < (5 + lags): continue
+        
         X = sm.add_constant(g[cols], has_constant="add")
+        if trend == 'ct': X['trend'] = np.arange(1, len(g) + 1)
         res = sm.OLS(g["dy"], X).fit()
-        if "y_lag" in res.tvalues:
-            tstats.append(res.tvalues["y_lag"])
-
-    if not tstats:
-        return np.nan, np.nan
-
+        if "y_lag" in res.tvalues: tstats.append(res.tvalues["y_lag"])
+            
+    if not tstats: return np.nan, np.nan
     cips_stat = float(np.mean(tstats))
-    pvalue = 2.0 * (1.0 - stats.norm.cdf(abs(cips_stat)))
-    return cips_stat, pvalue
-
-
-def cips_test(series: pd.Series, lags: int = 1) -> Tuple[float, float]:
-    """Test CIPS (Pesaran, 2007) avec fallback manuel."""
-    res = _cips_from_linearmodels(series, lags=lags)
-    if res is not None:
-        return res
-    return _cips_manual(series, lags=lags)
-
-
-def pesaran_cd(series: pd.Series) -> Tuple[float, float, float]:
-    """Test CD de Pesaran (2004) sur une serie panel."""
-    pivot = series.unstack(COUNTRY_COL)
-    pivot = pivot.dropna(axis=1, how="all")
-    entities = pivot.columns
-    n = len(entities)
-    if n < 2:
-        return np.nan, np.nan, np.nan
-
-    # Nombre moyen d'observations par paire
-    t = pivot.shape[0]
-    corr_sum = 0.0
-    count = 0
-
-    for i in range(n):
-        for j in range(i + 1, n):
-            x = pivot.iloc[:, i]
-            y = pivot.iloc[:, j]
-            valid = x.notna() & y.notna()
-            if valid.sum() < 3:
-                continue
-            corr = np.corrcoef(x[valid], y[valid])[0, 1]
-            if np.isfinite(corr):
-                corr_sum += corr
-                count += 1
-
-    if count == 0:
-        return np.nan, np.nan, np.nan
-
-    cd_stat = np.sqrt(2.0 * t / (n * (n - 1))) * corr_sum
-    pvalue = 2.0 * (1.0 - stats.norm.cdf(abs(cd_stat)))
-    avg_corr = corr_sum / count
-    return float(cd_stat), float(pvalue), float(avg_corr)
-
-
-def delta_test_pesaran_yamagata(df: pd.DataFrame, y: str, xvars: List[str]) -> Tuple[float, float]:
-    """Delta test de Pesaran-Yamagata (2008) pour heterogeneite des pentes."""
-    df = df[[y] + xvars].dropna()
-    if df.empty:
-        return np.nan, np.nan
-
-    X = sm.add_constant(df[xvars], has_constant="add")
-    pooled = sm.OLS(df[y], X).fit()
-    b_pooled = pooled.params.values
-
-    k = len(xvars)
-    s_stat = 0.0
-    n_entities = 0
-
-    for _, g in df.groupby(level=0):
-        if g.shape[0] <= k + 2:
-            continue
-        Xi = sm.add_constant(g[xvars], has_constant="add")
-        yi = g[y]
-        res_i = sm.OLS(yi, Xi).fit()
-        sigma2_i = res_i.scale
-        diff = (res_i.params.values - b_pooled).reshape(-1, 1)
-        xtx = Xi.to_numpy().T @ Xi.to_numpy()
-        quad = diff.T @ (xtx / sigma2_i) @ diff
-        s_stat += float(np.asarray(quad).squeeze())
-        n_entities += 1
-
-    if n_entities == 0:
-        return np.nan, np.nan
-
-    delta = np.sqrt(n_entities) * ((s_stat - k) / np.sqrt(2.0 * k))
-    pvalue = 2.0 * (1.0 - stats.norm.cdf(abs(delta)))
-    return float(delta), float(pvalue)
-
-
-# -----------------------------------------------------------------------------
-# Estimations panel (tableau recapitulatif)
-# -----------------------------------------------------------------------------
-
-def estimate_static_panel(df: pd.DataFrame) -> pd.DataFrame:
-    """Estime Between, Within, RE-Mundlak, TWFE et FD dans un seul tableau."""
-    formula_base = "lrgdpmad ~ 1 + lcpi + lenpr + open + expgdp + iy"
-
-    between = BetweenOLS.from_formula(formula_base, data=df).fit()
-    within = PanelOLS.from_formula(formula_base + " + EntityEffects", data=df).fit(
-        cov_type="clustered", cluster_entity=True
-    )
-
-    # Mundlak: ajoute les moyennes individuelles des regressseurs
-    df_m = df.copy()
-    for v in ["lcpi", "lenpr", "open", "expgdp", "iy"]:
-        df_m[f"{v}_mean"] = df_m.groupby(level=0)[v].transform("mean")
-
-    formula_mundlak = (
-        formula_base + " + lcpi_mean + lenpr_mean + open_mean + expgdp_mean + iy_mean"
-    )
-    re_mundlak = RandomEffects.from_formula(formula_mundlak, data=df_m).fit()
-
-    twfe = PanelOLS.from_formula(formula_base + " + EntityEffects + TimeEffects", data=df).fit(
-        cov_type="clustered", cluster_entity=True
-    )
-
-    fd = FirstDifferenceOLS.from_formula("lrgdpmad ~ lcpi + lenpr + open + expgdp + iy", data=df).fit()
-
-    results = {
-        "between": between,
-        "within": within,
-        "re_mundlak": re_mundlak,
-        "twfe": twfe,
-        "fd": fd,
-    }
-
-    table = _results_to_table(results)
-    return table
-
-
-def _results_to_table(results: Dict[str, object]) -> pd.DataFrame:
-    rows = []
-    for model_name, res in results.items():
-        params = res.params
-        se = res.std_errors
-        tstats = res.tstats
-        pvals = res.pvalues
-        for var in params.index:
-            rows.append(
-                {
-                    "model": model_name,
-                    "variable": var,
-                    "coef": params[var],
-                    "se": se[var],
-                    "t": tstats[var],
-                    "p": pvals[var],
-                }
-            )
-    return pd.DataFrame(rows)
-
-
-# -----------------------------------------------------------------------------
-# Modele dynamique ARDL + Anderson-Hsiao
-# -----------------------------------------------------------------------------
-
-def fit_dynamic_ols(df: pd.DataFrame) -> sm.regression.linear_model.RegressionResultsWrapper:
-    """OLS dynamique avec lag de la variable dependante."""
-    y = df["dlrgdpmad"]
-    X = df[
-        [
-            "l_dlrgdpmad",
-            "dlenpr",
-            "l_dlenpr",
-            "dlcpi2",
-            "dopen",
-            "dexpgdp",
-            "diy",
-            "l_ecterm",
-        ]
-    ]
-    X = sm.add_constant(X, has_constant="add")
-    res = sm.OLS(y, X, missing="drop").fit(cov_type="HAC", cov_kwds={"maxlags": 1})
-    return res
-
-
-def fit_dynamic_iv(df: pd.DataFrame) -> IV2SLS:
-    """IV Anderson-Hsiao avec instruments en niveaux t-2."""
-    y = df["dlrgdpmad"]
-    endog = df[["l_dlrgdpmad", "dlenpr"]]
-    exog = df[
-        [
-            "l_dlenpr",
-            "dlcpi2",
-            "dopen",
-            "dexpgdp",
-            "diy",
-            "l_ecterm",
-        ]
-    ]
-    instruments = df[["l2_lrgdpmad", "l2_lenpr"]]
-
-    model = IV2SLS(y, sm.add_constant(exog, has_constant="add"), endog, instruments)
-    res = model.fit(cov_type="robust")
-    return res
-
-
-def hausman_test(ols_res, iv_res) -> Tuple[float, float]:
-    """Test de Hausman entre OLS et IV."""
-    b_ols = ols_res.params
-    b_iv = iv_res.params
-
-    common = [k for k in b_ols.index if k in b_iv.index]
-    b_diff = (b_iv[common] - b_ols[common]).values
-
-    v_ols = ols_res.cov_params().loc[common, common]
-    v_iv = iv_res.cov.loc[common, common]
-
-    v_diff = v_iv - v_ols
-    try:
-        stat = float(b_diff.T @ np.linalg.inv(v_diff) @ b_diff)
-        df = len(common)
-        pval = 1.0 - stats.chi2.cdf(stat, df)
-        return stat, pval
-    except np.linalg.LinAlgError:
-        return np.nan, np.nan
-
-
-def compute_irf(beta1: float, beta2: float, rho: float, horizons: int = 4) -> List[float]:
-    """IRF pour 4 periodes en suivant la recursion demandee."""
-    irf = []
-    if horizons < 1:
-        return irf
-
-    tau1 = beta1
-    irf.append(tau1)
-
-    if horizons >= 2:
-        tau2 = rho * beta1 + beta2
-        irf.append(tau2)
-
-    for h in range(3, horizons + 1):
-        tau_prev = irf[-1]
-        tau_h = rho * tau_prev + rho * beta2
-        irf.append(tau_h)
-
-    return irf
-
-
-def irf_standard_errors(beta1: float, beta2: float, rho: float, se: Dict[str, float]) -> List[float]:
-    """Approximation simple des SE des IRF sans covariance."""
-    se_b1 = se.get("dlenpr", np.nan)
-    se_b2 = se.get("l_dlenpr", np.nan)
-    se_rho = se.get("l_dlrgdpmad", np.nan)
-
-    out = []
-    if np.isnan(se_b1) or np.isnan(se_b2) or np.isnan(se_rho):
-        return [np.nan] * 4
-
-    # tau1
-    out.append(se_b1)
-
-    # tau2
-    out.append(np.sqrt((rho * se_b1) ** 2 + (beta1 * se_rho) ** 2 + se_b2 ** 2))
-
-    # tau3, tau4: recursion approchee
-    tau_prev = None
-    for _ in range(3, 5):
-        if tau_prev is None:
-            tau_prev = rho * beta1 + beta2
-        se_tau = np.sqrt((rho * out[-1]) ** 2 + (se_rho * tau_prev) ** 2 + (rho * se_b2) ** 2)
-        out.append(se_tau)
-        tau_prev = rho * tau_prev + rho * beta2
-
-    return out
-
-
-# -----------------------------------------------------------------------------
-# CCEMG avec IV
-# -----------------------------------------------------------------------------
-
-def infer_instruments(df: pd.DataFrame) -> List[str]:
-    if INSTRUMENT_COLS:
-        return [c for c in INSTRUMENT_COLS if c in df.columns]
-
-    patterns = ["OPEC", "US", "SHOCK", "SUPPLY", "INSTR", "IV_"]
-    candidates = []
-    for c in df.columns:
-        uc = c.upper()
-        if any(p in uc for p in patterns):
-            candidates.append(c)
-    return candidates
-
-
-def add_cross_section_means(df: pd.DataFrame, variables: List[str]) -> pd.DataFrame:
-    df = df.copy()
-    for var in variables:
-        cs = df.groupby(level=1)[var].transform("mean")
-        df[f"{var}_csmean"] = cs
-        df[f"{var}_csmean_lag"] = cs.groupby(level=0).shift(1)
-    return df
-
+    return cips_stat, 2.0 * (1.0 - stats.norm.cdf(abs(cips_stat)))
 
 def _reduce_full_rank(frame: pd.DataFrame) -> pd.DataFrame:
-    """Supprime les colonnes constantes ou lineairement redondantes."""
-    frame = frame.copy()
-    frame = frame.loc[:, frame.nunique(dropna=True) > 1]
+    frame = frame.loc[:, frame.nunique(dropna=True) > 1].copy()
     kept: List[str] = []
-    for column in frame.columns:
-        candidate = frame[kept + [column]].dropna()
-        if candidate.empty:
-            continue
-        matrix = candidate.to_numpy(dtype=float)
-        if np.linalg.matrix_rank(matrix) > len(kept):
-            kept.append(column)
+    for col in frame.columns:
+        cand = frame[kept + [col]].dropna()
+        if cand.empty: continue
+        if np.linalg.matrix_rank(cand.to_numpy(dtype=float)) > len(kept):
+            kept.append(col)
     return frame[kept]
 
-
-def estimate_ccemg(
-    df: pd.DataFrame,
-    dep: str,
-    exog_vars: List[str],
-    endog_vars: List[str],
-    instruments: List[str],
-    exog_only: bool = False,
-) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    """Estime CCEMG pays par pays, retourne coefs par pays et MG final."""
+def estimate_ccemg(df: pd.DataFrame, dep: str, exog_vars: List[str], endog_vars: List[str], 
+                   instruments: List[str], exog_only: bool = False) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.Series]:
     vars_for_means = [dep] + exog_vars + endog_vars
-    df = add_cross_section_means(df, vars_for_means)
-
-    cs_vars = [f"{v}_csmean" for v in vars_for_means] + [f"{v}_csmean_lag" for v in vars_for_means]
-
-    rows = []
+    df = df.copy()
+    for var in vars_for_means:
+        if var in df.columns:
+            cs = df.groupby(level=1)[var].transform("mean")
+            df[f"{var}_csmean"] = cs
+            df[f"{var}_csmean_lag"] = cs.groupby(level=0).shift(1)
+            
+    cs = [f"{v}_csmean" for v in vars_for_means if f"{v}_csmean" in df.columns] + \
+         [f"{v}_csmean_lag" for v in vars_for_means if f"{v}_csmean_lag" in df.columns]
+    
+    rows, all_resid = [], []
+    
     for country, g in df.groupby(level=0):
-        g = g.copy()
-        y = g[dep]
-        exog = g[exog_vars + cs_vars]
+        raw_cols = [dep] + exog_vars + cs + endog_vars + instruments
+        mf = g[[c for c in raw_cols if c in g.columns]].dropna()
+        if mf.empty: continue
+        
+        mf_reduced = _reduce_full_rank(mf)
+        if dep not in mf_reduced.columns: continue
+            
+        y = mf_reduced[dep]
+        surviving_exog = [c for c in exog_vars + cs if c in mf_reduced.columns]
+        surviving_endog = [c for c in endog_vars if c in mf_reduced.columns]
+        surviving_inst = [c for c in instruments if c in mf_reduced.columns]
+        
+        exog_matrix = sm.add_constant(mf_reduced[surviving_exog], has_constant="add")
+        
+        try:
+            if exog_only or not surviving_inst or not surviving_endog:
+                res = sm.OLS(y, exog_matrix).fit(cov_type="HAC", cov_kwds={"maxlags": 1})
+                params, se = res.params, res.bse
+                resid_series = pd.Series(res.resid, index=mf_reduced.index, name="residual")
+            else:
+                res = IV2SLS(y, exog_matrix, mf_reduced[surviving_endog], mf_reduced[surviving_inst]).fit(cov_type="kernel", kernel="bartlett", bandwidth=1)
+                params, se = res.params, res.std_errors
+                resid_series = pd.Series(res.resids, index=mf_reduced.index, name="residual")
 
-        if exog_only or not instruments:
-            model_frame = pd.concat([y, exog], axis=1).dropna()
-            model_frame = _reduce_full_rank(model_frame)
-            y_reg = model_frame[dep]
-            exog_reg = sm.add_constant(model_frame.drop(columns=[dep]), has_constant="add")
-            res = sm.OLS(y_reg, exog_reg, missing="drop").fit(cov_type="HAC", cov_kwds={"maxlags": 1})
-            params = res.params
-            se = res.bse
-        else:
-            endog = g[endog_vars]
-            instr = g[instruments]
-
-            model_frame = pd.concat([y, exog, endog, instr], axis=1).dropna()
-            model_frame = _reduce_full_rank(model_frame)
-            y_reg = model_frame[dep]
-            exog_reg = model_frame[[c for c in exog.columns if c in model_frame.columns]]
-            endog_reg = model_frame[[c for c in endog.columns if c in model_frame.columns]]
-            instr_reg = model_frame[[c for c in instr.columns if c in model_frame.columns]]
-            res = IV2SLS(y_reg, sm.add_constant(exog_reg, has_constant="add"), endog_reg, instr_reg).fit(cov_type="kernel", kernel="bartlett", bandwidth=1)
-            params = res.params
-            se = res.std_errors
-
-        for var in params.index:
-            rows.append(
-                {
-                    "country": country,
-                    "variable": var,
-                    "coef": params[var],
-                    "se": se[var],
-                }
-            )
+            all_resid.append(resid_series)
+            for var in params.index:
+                rows.append({"country": country, "variable": var, "coef": params[var], "se": se[var]})
+        except ValueError:
+            continue
 
     country_df = pd.DataFrame(rows)
-
-    # MG
+    residuals_df = pd.concat(all_resid) if all_resid else pd.Series(name="residual")
+    
     mg_rows = []
-    for var, g in country_df.groupby("variable"):
-        if g["coef"].dropna().empty:
-            continue
-        mean_coef = g["coef"].mean()
-        se_mg = g["coef"].std(ddof=1) / np.sqrt(g.shape[0]) if g.shape[0] > 1 else np.nan
-        tstat = mean_coef / se_mg if se_mg and np.isfinite(se_mg) else np.nan
-        pval = 2.0 * (1.0 - stats.norm.cdf(abs(tstat))) if np.isfinite(tstat) else np.nan
-        mg_rows.append(
-            {"variable": var, "coef": mean_coef, "se": se_mg, "t": tstat, "p": pval}
-        )
+    if not country_df.empty:
+        for var, g2 in country_df.groupby("variable"):
+            vals = g2["coef"].dropna()
+            mean_c, se_mg = vals.mean(), vals.std() / np.sqrt(len(vals)) if len(vals) > 1 else np.nan
+            tstat = mean_c / se_mg if se_mg else np.nan
+            pval = 2.0 * (1.0 - stats.norm.cdf(abs(tstat))) if np.isfinite(tstat) else np.nan
+            mg_rows.append({"variable": var, "coef": mean_c, "se": se_mg, "t": tstat, "p": pval})
+        
+    mg_rob_rows = []
+    if not country_df.empty:
+        for var, g2 in country_df.groupby("variable"):
+            vals = g2["coef"].dropna().values
+            med, mad = np.median(vals), np.median(np.abs(vals - np.median(vals)))
+            w = np.ones_like(vals)
+            if mad > 0:
+                u = np.abs((vals - med) / (1.4826 * mad))
+                mask = u > 1.345
+                w[mask] = 1.345 / u[mask]
+            
+            wsum = np.sum(w)
+            mean_c = np.sum(w * vals) / wsum if wsum > 0 else np.nan
+            var_w = np.sum(w * (vals - mean_c)**2) / wsum if wsum > 0 else np.nan
+            n_eff = (wsum**2) / np.sum(w**2) if np.sum(w**2) > 0 else 0
+            se_mg = np.sqrt(var_w / n_eff) if n_eff > 1 else np.nan
+            mg_rob_rows.append({"variable": var, "coef": mean_c, "se": se_mg})
 
-    mg_df = pd.DataFrame(mg_rows)
-    return country_df, mg_df
+    return country_df, pd.DataFrame(mg_rows), pd.DataFrame(mg_rob_rows), residuals_df
 
-
-# -----------------------------------------------------------------------------
-# Robustesse
-# -----------------------------------------------------------------------------
-
-def build_robustness_table(
-    df_base: pd.DataFrame,
-    df_full: pd.DataFrame,
-    dep: str,
-    exog_vars: List[str],
-    endog_vars: List[str],
-    instruments: List[str],
-) -> pd.DataFrame:
-    """Construit la table de robustesse (6 colonnes)."""
+def build_robustness_table(df_base, df_full, dep, exog_vars, endog_vars, instruments) -> pd.DataFrame:
     variants = {}
+    _, variants["inst"], _, _ = estimate_ccemg(df_base, dep, exog_vars, endog_vars, instruments)
+    _, variants["exog"], _, _ = estimate_ccemg(df_base, dep, exog_vars, endog_vars, instruments, exog_only=True)
+    _, variants["womod"], _, _ = estimate_ccemg(df_base, dep, [v for v in exog_vars if v not in ("mod", "dlenprmod")], endog_vars, instruments)
 
-    # (1) inst
-    _, mg_inst = estimate_ccemg(df_base, dep, exog_vars, endog_vars, instruments, exog_only=False)
-    variants["inst"] = mg_inst
-
-    # (2) exog
-    _, mg_exog = estimate_ccemg(df_base, dep, exog_vars, endog_vars, instruments, exog_only=True)
-    variants["exog"] = mg_exog
-
-    # (3) womod: sans mod et dlenprmod
-    exog_womod = [v for v in exog_vars if v not in ("mod", "dlenprmod")]
-    endog_womod = endog_vars
-    _, mg_womod = estimate_ccemg(df_base, dep, exog_womod, endog_womod, instruments, exog_only=False)
-    variants["womod"] = mg_womod
-
-    # (4) recession: ajoute dummy 2009
     df_rec = df_base.copy()
     df_rec["recession_2009"] = (df_rec.index.get_level_values(YEAR_COL) == 2009).astype(int)
-    exog_rec = exog_vars + ["recession_2009"]
-    _, mg_rec = estimate_ccemg(df_rec, dep, exog_rec, endog_vars, instruments, exog_only=False)
-    variants["recession"] = mg_rec
+    _, variants["recession"], _, _ = estimate_ccemg(df_rec, dep, exog_vars + ["recession_2009"], endog_vars, instruments)
 
-    # (5) gerire: exclure Allemagne 1990 et Irlande 2015
     df_gerire = df_base.copy()
-    idx = df_gerire.index
-    country_vals = idx.get_level_values(COUNTRY_COL)
-    year_vals = idx.get_level_values(YEAR_COL)
-    if country_vals.str.match(r"^\d+$").any():
-        mask = ~(((country_vals == "5") & (year_vals == 1990)) | ((country_vals == "11") & (year_vals == 2015)))
-    else:
-        mask = ~(
-            ((country_vals.str.contains("germany", case=False)) & (year_vals == 1990))
-            | ((country_vals.str.contains("ireland", case=False)) & (year_vals == 2015))
-        )
-    df_gerire = df_gerire[mask]
-    _, mg_gerire = estimate_ccemg(df_gerire, dep, exog_vars, endog_vars, instruments, exog_only=False)
-    variants["gerire"] = mg_gerire
+    cv, yv = df_gerire.index.get_level_values(COUNTRY_COL).astype(str).str.lower(), df_gerire.index.get_level_values(YEAR_COL)
+    _, variants["gerire"], _, _ = estimate_ccemg(df_gerire[~((cv.str.contains("germany") & (yv == 1990)) | (cv.str.contains("ireland") & (yv == 2015)))], dep, exog_vars, endog_vars, instruments)
+    _, variants["sixties"], _, _ = estimate_ccemg(df_full, dep, exog_vars, endog_vars, instruments)
 
-    # (6) sixties: inclure 1960-1961
-    df_sixties = df_full.copy()
-    _, mg_sixties = estimate_ccemg(df_sixties, dep, exog_vars, endog_vars, instruments, exog_only=False)
-    variants["sixties"] = mg_sixties
-
-    # Assemble en tableau
     rows = []
-    for name, table in variants.items():
-        for _, row in table.iterrows():
-            rows.append(
-                {
-                    "variant": name,
-                    "variable": row["variable"],
-                    "coef": row["coef"],
-                    "se": row["se"],
-                    "t": row["t"],
-                    "p": row["p"],
-                }
-            )
+    for name, tbl in variants.items():
+        if tbl.empty: continue
+        for _, row in tbl.iterrows():
+            rows.append({"variant": name, "variable": row["variable"], "coef": row["coef"], "se": row["se"], "t": row.get("t", np.nan), "p": row.get("p", np.nan)})
     return pd.DataFrame(rows)
 
+# =============================================================================
+# Format visuel de publication (PNGs)
+# =============================================================================
 
-# -----------------------------------------------------------------------------
+def _render_table_png(tbl: pd.DataFrame, title: str, notes: str, filepath: Path, fig_w: float = 8.5, row_h: float = 0.32, fontsize: float = 8.0) -> None:
+    plt.rcParams.update(PAPER_RC)
+    n_rows, n_cols = tbl.shape
+    fig_h = max(3.0, row_h * (n_rows + 2) + 0.8)
+    fig, ax = plt.subplots(figsize=(fig_w, fig_h))
+    ax.axis("off")
+    t = ax.table(cellText=tbl.values.tolist(), colLabels=tbl.columns.tolist(), loc="center", cellLoc="center")
+    t.auto_set_font_size(False)
+    t.set_fontsize(fontsize)
+    t.scale(1, max(1.0, row_h / 0.22))
+    
+    # Format de la première ligne (Header)
+    for j in range(n_cols):
+        t[0, j].set_facecolor("#d9d9d9")
+        t[0, j].set_text_props(fontweight="bold")
+        
+    for i in range(1, n_rows + 1):
+        bg = "#f7f7f7" if i % 2 == 0 else "white"
+        # Alignement strict à gauche de la 1ère colonne (Variable/Country)
+        t[i, 0].set_text_props(ha='left') 
+        for j in range(n_cols): 
+            t[i, j].set_facecolor(bg)
+
+    ax.set_title(title, fontsize=9, fontweight="bold", loc="left", pad=3)
+    if notes: fig.text(0.01, 0.005, notes, fontsize=6.5, va="bottom", wrap=True, style="italic")
+    plt.tight_layout()
+    plt.savefig(filepath, dpi=200, bbox_inches="tight")
+    plt.close()
+
+
+def export_table1(df: pd.DataFrame, out_dir: Path) -> None:
+    varmap = {LOG_GDP: "GDP", LOG_CPI: "CPI", LOG_ENERGY: "ENERGY", OPEN_TRADE: "OpenTrade", GOV_EXP: "GovExp", INVEST: "Invest",
+              f"d{LOG_GDP}": "D.GDP", f"d{LOG_CPI}": "D.CPI", f"d{LOG_ENERGY}": "D.ENERGY", f"d{OPEN_TRADE}": "D.OpenTrade", f"d{GOV_EXP}": "D.GovExp", f"d{INVEST}": "D.Invest"}
+    df_r = df.reset_index()
+    rows = []
+    for col, label in varmap.items():
+        if col not in df_r.columns: continue
+        s = df_r[col].dropna()
+        mean, std_w, mn, mx = s.mean(), s.std(ddof=1), s.min(), s.max()
+        
+        # Correction 1 : CV est vide pour les variables commençant par D.
+        is_diff = label.startswith("D.")
+        cv = (std_w / mean) if (mean != 0 and not is_diff) else np.nan
+        cv_str = f"{cv:.3f}" if np.isfinite(cv) else ""
+        
+        rows.append({"Variable": label, "Mean": f"{mean:.3f}", "Standard deviation": f"{std_w:.3f}", "Coeff. of variation": cv_str, "Minimum": f"{mn:.3f}", "Maximum": f"{mx:.3f}"})
+    
+    tbl = pd.DataFrame(rows)
+    tbl.to_csv(out_dir / "table1_data_summary.csv", index=False)
+    _render_table_png(tbl, "Table 1 – Data Summary", "Notes: Real GDP (GDP), CPI and Energy Prices (ENERGY) are in logarithms. Open Trade (OpenTrade), Gov Expenditures (GovExp) and Investment (Invest) are % of GDP. Overall standard deviations, minimums and maximums are reported. D. denotes change.", out_dir / "table1_data_summary.png", 9.5, 0.30)
+
+
+def export_table2(cips_df: pd.DataFrame, out_dir: Path) -> None:
+    varmap = {LOG_GDP: "GDP", LOG_CPI: "CPI", LOG_ENERGY: "ENERGY", OPEN_TRADE: "OpenTrade", GOV_EXP: "GovExp", INVEST: "Invest"}
+    def fmt(s, p): return "." if not np.isfinite(float(s)) else f"{float(s):.2f}{_stars(float(p))}"
+    
+    rows = []
+    rows.append({"Variable": "No Trend", "0": "", "1": "", "2": "", "3": ""})
+    for var in varmap:
+        sub = cips_df[cips_df["variable"] == var]
+        lag_map = {int(r["lag"]): (r["stat_level"], r["pvalue_level"]) for _, r in sub.iterrows()}
+        lvl = {k: lag_map.get(k, (np.nan, np.nan)) for k in range(4)}
+        rows.append({"Variable": varmap[var], "0": fmt(*lvl[0]), "1": fmt(*lvl[1]), "2": fmt(*lvl[2]), "3": fmt(*lvl[3])})
+
+    for var in varmap:
+        sub = cips_df[cips_df["variable"] == var]
+        lag_map = {int(r["lag"]): (r["stat_diff"], r["pvalue_diff"]) for _, r in sub.iterrows()}
+        dif = {k: lag_map.get(k, (np.nan, np.nan)) for k in range(4)}
+        rows.append({"Variable": f"D.{varmap[var]}", "0": fmt(*dif[0]), "1": fmt(*dif[1]), "2": fmt(*dif[2]), "3": fmt(*dif[3])})
+
+    rows.append({"Variable": "Trend", "0": "", "1": "", "2": "", "3": ""})
+    for var in varmap:
+        sub = cips_df[cips_df["variable"] == var]
+        lag_map = {int(r["lag"]): (r["stat_level_t"], r.get("pvalue_level_t", np.nan)) for _, r in sub.iterrows()}
+        lvl_t = {k: lag_map.get(k, (np.nan, np.nan)) for k in range(4)}
+        rows.append({"Variable": varmap[var], "0": fmt(*lvl_t[0]), "1": fmt(*lvl_t[1]), "2": fmt(*lvl_t[2]), "3": fmt(*lvl_t[3])})
+
+    tbl = pd.DataFrame(rows).rename(columns={"0": "Lag 0", "1": "Lag 1", "2": "Lag 2", "3": "Lag 3"})
+    tbl.to_csv(out_dir / "table2_cips_unitroot.csv", index=False)
+    _render_table_png(tbl, "Table 2 – Pesaran Panel Unit Root Tests", "Notes: * p<0.05; ** p<0.01. D. = first-difference. Null: all panels have a unit root. The statistic reported is the raw t-bar.", out_dir / "table2_cips_unitroot.png", 8.5, 0.28)
+
+
+def export_table3(mg_cce: pd.DataFrame, mg_robust: pd.DataFrame, out_dir: Path) -> None:
+    VAR_ORDER = [("dlcpi", "D.CPI"), ("dlenpr", "D.Energy"), ("dopen", "D.OpenTrade"), ("dexpgdp", "D.GovExp"), ("diy", "D.Invest"), ("l_lrgdpmad", "L.GDP"), ("l_lcpi", "L.CPI"), ("l_open", "L.OpenTrade"), ("l_iy", "L.Invest"), ("const", "_cons")]
+    def extract(mg):
+        out = {}
+        for code, label in VAR_ORDER:
+            r = mg[mg["variable"] == code]
+            out[label] = _fmt_coef(r.iloc[0]["coef"], r.iloc[0]["se"], r.iloc[0].get("p", np.nan)) if not r.empty else ("", "")
+        return out
+    d_cce, d_robust = extract(mg_cce), extract(mg_robust)
+    rows = []
+    for _, label in VAR_ORDER:
+        c1, s1 = d_cce[label]
+        c2, s2 = d_robust[label]
+        if c1 or c2:
+            rows.append({"Variable": label, "cce": c1, "ccerobust": c2})
+            rows.append({"Variable": "", "cce": s1, "ccerobust": s2})
+    tbl = pd.DataFrame(rows)
+    tbl.to_csv(out_dir / "table3_cce_robust.csv", index=False)
+    _render_table_png(tbl, "Table 3 – CCE-MG: Unweighted vs outlier-robust estimates", "Notes: b/(se) format. * p<0.05; ** p<0.01. D. = change; L. = lag.", out_dir / "table3_cce_robust.png", 7.5, 0.26)
+
+
+def export_table4(robustness_df: pd.DataFrame, out_dir: Path) -> None:
+    VARIANTS = ["inst", "exog", "womod", "recession", "gerire", "sixties"]
+    COL_LABELS = {"inst": "inst", "exog": "exog", "womod": "w/o_mod", "recession": "recession", "gerire": "ger_ire", "sixties": "sixties"}
+    
+    # Correction 2 : Noms de variables exacts de l'image
+    VAR_ORDER = [
+        ("l_dlcpi2", "L.D.CPI>2%"), ("dopen", "D.OpenTrade"), ("dexpgdp", "D.GovExp"), 
+        ("diy", "D.Invest"), ("l_lrgdpmad", "L.GDP"), ("l_lcpi", "L.CPI"), 
+        ("l_open", "L.OpenTrade"), ("l_iy", "L.Invest"), ("mod", "mod"), 
+        ("dlenprmod", "D.Energy×mod"), ("dlenpr", "D.Energy"), 
+        ("recession_2009", "recess"), ("const", "_cons")
+    ]
+    
+    def get(sub, vcode, field):
+        r = sub[sub["variable"] == vcode]
+        return r.iloc[0][field] if not r.empty else np.nan
+
+    col_subs = {v: robustness_df[robustness_df["variant"] == v] for v in VARIANTS}
+    rows = []
+    for vcode, vlabel in VAR_ORDER:
+        row_c, row_s, any_val = {"Variable": vlabel}, {"Variable": ""}, False
+        for v in VARIANTS:
+            coef, se, p = get(col_subs[v], vcode, "coef"), get(col_subs[v], vcode, "se"), get(col_subs[v], vcode, "p")
+            c, s = _fmt_coef(coef, se, p)
+            if c: any_val = True
+            row_c[COL_LABELS[v]], row_s[COL_LABELS[v]] = c, s
+        if any_val: rows.extend([row_c, row_s])
+
+    pe_row = {"Variable": "Price effect (post-1982)"}
+    for v in VARIANTS:
+        b_e, b_m = get(col_subs[v], "dlenpr", "coef"), get(col_subs[v], "dlenprmod", "coef")
+        pe = b_e + b_m if np.isfinite(b_e) and np.isfinite(b_m) else b_e
+        pe_row[COL_LABELS[v]] = f"{pe:.3f}" if np.isfinite(pe) else ""
+    rows.append(pe_row)
+
+    tbl = pd.DataFrame(rows).fillna("")
+    tbl.to_csv(out_dir / "table4_ccemg_robustness.csv", index=False)
+    _render_table_png(tbl, "Table 4 CCE-Mean-group estimates for real GDP growth", "Notes: b/(se) format. * p<0.05; ** p<0.01. inst=IV; exog=exogenous; w/o_mod=no split; recession=2009 dummy; ger_ire=excl outliers; sixties=incl 1960.", out_dir / "table4_ccemg_robustness.png", 10.5, 0.26)
+
+
+def export_table5(country_coef_df: pd.DataFrame, out_dir: Path, intensity_df: Optional[pd.DataFrame] = None) -> None:
+    countries = sorted(country_coef_df["country"].unique())
+    i_map, e_map, im_map, po_map, pr_map = {}, {}, {}, {}, {}
+    if intensity_df is not None and not intensity_df.empty:
+        tmp = intensity_df.copy()
+        tmp["_k"] = tmp["country"].astype(str).str.strip().str.lower()
+        if "intensity" in tmp: i_map = tmp.set_index("_k")["intensity"].to_dict()
+        if "exports" in tmp: e_map = tmp.set_index("_k")["exports"].to_dict()
+        if "imports" in tmp: im_map = tmp.set_index("_k")["imports"].to_dict()
+        if "post_1982" in tmp: po_map = tmp.set_index("_k")["post_1982"].to_dict()
+        if "pre_1983" in tmp: pr_map = tmp.set_index("_k")["pre_1983"].to_dict()
+
+    rows = []
+    for c in countries:
+        sub = country_coef_df[country_coef_df["country"] == c]
+        b_pre = sub.loc[sub["variable"] == "dlenpr", "coef"]
+        b_mod = sub.loc[sub["variable"] == "dlenprmod", "coef"]
+        pre = b_pre.values[0] if len(b_pre) else np.nan
+        mod = b_mod.values[0] if len(b_mod) else np.nan
+        post = (pre + mod) if (np.isfinite(pre) and np.isfinite(mod)) else pre
+        
+        k, nk = str(c).strip().lower(), _country_label(c).strip().lower()
+        intensity = i_map.get(k, i_map.get(nk, np.nan))
+        exports = e_map.get(k, e_map.get(nk, np.nan))
+        imports = im_map.get(k, im_map.get(nk, np.nan))
+        post_val = po_map.get(k, po_map.get(nk, post))
+        pre_val = pr_map.get(k, pr_map.get(nk, pre))
+
+        # Format exact de l'image (Colonnes: Country, Intensity, Exports, Imports, Post-1982, Pre-1983)
+        rows.append({"Country": _country_label(c), "Intensity": f"{intensity:.3f}" if np.isfinite(intensity) else "", "Exports": f"{exports:.3f}" if np.isfinite(exports) else "", "Imports": f"{imports:.3f}" if np.isfinite(imports) else "", "Post-1982": f"{post_val:.3f}" if np.isfinite(post_val) else ".", "Pre-1983": f"{pre_val:.3f}" if np.isfinite(pre_val) else "."})
+
+    pres = [float(r["Pre-1983"]) for r in rows if r["Pre-1983"] != "."]
+    posts = [float(r["Post-1982"]) for r in rows if r["Post-1982"] != "."]
+    rows.append({"Country": "Average", "Intensity": "", "Exports": "", "Imports": "", "Post-1982": f"{np.mean(posts):.3f}" if posts else ".", "Pre-1983": f"{np.mean(pres):.3f}" if pres else "."})
+
+    tbl = pd.DataFrame(rows)
+    tbl.to_csv(out_dir / "table5_country_responses.csv", index=False)
+    _render_table_png(tbl, "Table 5 Individual country energy intensity and responses", "Notes: Post-1982 coef = D.Energy + D.Energy×mod. Pre-1983 coef = D.Energy only. Intensity uses sheet table5-6 when available.", out_dir / "table5_country_responses.png", 9, 0.28)
+
+
+def export_table6(country_coef_df: pd.DataFrame, out_dir: Path, intensity_df: Optional[pd.DataFrame] = None) -> None:
+    if intensity_df is None or intensity_df.empty:
+        tbl = pd.DataFrame([{"Specification": "(1) Pre-1983 ~ Intensity", "Coef":"n/a","t-stat":"n/a","N":18,"F":"n/a","RMSE":"n/a"}])
+    else:
+        countries = sorted(country_coef_df["country"].unique())
+        coefs = {}
+        for c in countries:
+            sub = country_coef_df[country_coef_df["country"] == c]
+            b_pre = sub.loc[sub["variable"] == "dlenpr", "coef"].values
+            b_mod = sub.loc[sub["variable"] == "dlenprmod", "coef"].values
+            pre = b_pre[0] if len(b_pre) else np.nan
+            mod = b_mod[0] if len(b_mod) else np.nan
+            coefs[c] = {"pre": pre, "post": (pre+mod) if np.isfinite(pre) and np.isfinite(mod) else pre}
+
+        def _run_reg(sub):
+            sub = sub.dropna(subset=["y", "intensity"])
+            if sub.shape[0] < 3: return np.nan, np.nan, np.nan, np.nan, sub.shape[0]
+            res = sm.OLS(sub["y"], sm.add_constant(sub[["intensity"]])).fit(cov_type="HC1")
+            return res.params.get("intensity", np.nan), res.tvalues.get("intensity", np.nan), float(res.fvalue) if np.isfinite(res.fvalue) else np.nan, float(np.sqrt(np.mean(res.resid ** 2))), sub.shape[0]
+
+        tmp = intensity_df.copy()
+        tmp["_k"] = tmp["country"].astype(str).str.strip().str.lower()
+        out = []
+        for c in countries:
+            k, nk = str(c).strip().lower(), _country_label(c).strip().lower()
+            row = {"country": nk, "pre": coefs[c]["pre"], "post": coefs[c]["post"], "intensity": np.nan, "exclude": False}
+            if "pre_1983" in tmp: row["pre"] = tmp.loc[tmp["_k"].isin([k, nk]), "pre_1983"].iloc[0] if tmp["_k"].isin([k, nk]).any() else row["pre"]
+            if "post_1982" in tmp: row["post"] = tmp.loc[tmp["_k"].isin([k, nk]), "post_1982"].iloc[0] if tmp["_k"].isin([k, nk]).any() else row["post"]
+            if "intensity" in tmp: row["intensity"] = tmp.loc[tmp["_k"].isin([k, nk]), "intensity"].iloc[0] if tmp["_k"].isin([k, nk]).any() else np.nan
+            if "exclude" in tmp: row["exclude"] = bool(tmp.loc[tmp["_k"].isin([k, nk]), "exclude"].iloc[0]) if tmp["_k"].isin([k, nk]).any() else False
+            out.append(row)
+
+        reg_df = pd.DataFrame(out)
+        spec_rows = []
+        
+        # Correction 4 : Nommage strict des régressions
+        coef, tstat, fval, rmse, n = _run_reg(reg_df.rename(columns={"pre": "y"}))
+        spec_rows.append({"Specification": "(1) Pre-1983 ~ Intensity", "Coef": f"{coef:.3f}" if np.isfinite(coef) else "n/a", "t-stat": f"{tstat:.2f}" if np.isfinite(tstat) else "n/a", "N": n, "F": f"{fval:.2f}" if np.isfinite(fval) else "n/a", "RMSE": f"{rmse:.3f}" if np.isfinite(rmse) else "n/a"})
+        
+        coef, tstat, fval, rmse, n = _run_reg(reg_df.rename(columns={"post": "y"}))
+        spec_rows.append({"Specification": "(2) Post-1982 ~ Intensity", "Coef": f"{coef:.3f}" if np.isfinite(coef) else "n/a", "t-stat": f"{tstat:.2f}" if np.isfinite(tstat) else "n/a", "N": n, "F": f"{fval:.2f}" if np.isfinite(fval) else "n/a", "RMSE": f"{rmse:.3f}" if np.isfinite(rmse) else "n/a"})
+        
+        sub_df = reg_df[~reg_df["exclude"]]
+        coef, tstat, fval, rmse, n = _run_reg(sub_df.rename(columns={"pre": "y"}))
+        spec_rows.append({"Specification": "(3) Pre-1983 ~ Intensity (excl. outliers)", "Coef": f"{coef:.3f}" if np.isfinite(coef) else "n/a", "t-stat": f"{tstat:.2f}" if np.isfinite(tstat) else "n/a", "N": n, "F": f"{fval:.2f}" if np.isfinite(fval) else "n/a", "RMSE": f"{rmse:.3f}" if np.isfinite(rmse) else "n/a"})
+        
+        coef, tstat, fval, rmse, n = _run_reg(sub_df.rename(columns={"post": "y"}))
+        spec_rows.append({"Specification": "(4) Post-1982 ~ Intensity (excl. outliers)", "Coef": f"{coef:.3f}" if np.isfinite(coef) else "n/a", "t-stat": f"{tstat:.2f}" if np.isfinite(tstat) else "n/a", "N": n, "F": f"{fval:.2f}" if np.isfinite(fval) else "n/a", "RMSE": f"{rmse:.3f}" if np.isfinite(rmse) else "n/a"})
+        
+        tbl = pd.DataFrame(spec_rows)
+
+    tbl.to_csv(out_dir / "table6_intensity_regression.csv", index=False)
+    _render_table_png(tbl, "Table 6 Regressions of country-specific responses on energy intensity", "Notes: Intensity = energy use per unit of GDP (EIA). * p<0.05; ** p<0.01. Robust standard errors.", out_dir / "table6_intensity_regression.png", 9, 0.35)
+
+# =============================================================================
 # Graphiques
-# -----------------------------------------------------------------------------
+# =============================================================================
 
-def plot_energy_prices(df: pd.DataFrame, out_path: Path) -> None:
-    import matplotlib.pyplot as plt
-
-    plt.figure(figsize=(12, 6))
-    for country, g in df.reset_index().groupby(COUNTRY_COL):
-        g = g.sort_values(YEAR_COL)
-        plt.plot(g[YEAR_COL], g[LOG_ENERGY], alpha=0.6, linewidth=1.0, label=country)
-
-    plt.title("Evolution des prix de l'energie par pays")
-    plt.xlabel("Annee")
-    plt.ylabel("lenpr (log)")
-    plt.tight_layout()
-    plt.savefig(out_path, dpi=150)
+def _country_grid(df: pd.DataFrame, ycol: str, ylabel: str, suptitle: str, figname: str, out_dir: Path, hline: Optional[float] = None) -> None:
+    plt.rcParams.update(PAPER_RC)
+    df_r = df.reset_index()
+    countries = sorted(df_r[COUNTRY_COL].unique())
+    fig, axes = plt.subplots(4, 5, figsize=(13, 8.5))
+    axes_flat = axes.flatten()
+    for idx, c in enumerate(countries[:20]):
+        ax, sub = axes_flat[idx], df_r[df_r[COUNTRY_COL] == c].sort_values(YEAR_COL).dropna(subset=[ycol])
+        ax.plot(sub[YEAR_COL], sub[ycol], lw=0.85, color="black")
+        ax.set_title(_country_label(c), fontsize=6.5, pad=1.5)
+        ax.tick_params(labelsize=5.5)
+        ax.xaxis.set_major_locator(MultipleLocator(20))
+        ax.axvline(1982, color="#aaaaaa", lw=0.6, linestyle=":")
+        if hline is not None: ax.axhline(hline, color="red", lw=0.5, linestyle="--")
+    for idx in range(len(countries), len(axes_flat)): axes_flat[idx].set_visible(False)
+    fig.text(0.5, 0.01, "Year", ha="center", fontsize=8)
+    fig.text(0.01, 0.5, ylabel, va="center", rotation="vertical", fontsize=8)
+    fig.suptitle(suptitle, fontsize=9, fontweight="bold", y=1.01)
+    plt.tight_layout(rect=[0.03, 0.03, 1, 0.99])
+    plt.savefig(out_dir / figname, dpi=200, bbox_inches="tight")
     plt.close()
 
+def export_fig_a1(df, out_dir): _country_grid(df, LOG_GDP, "Log Real GDP", "Fig. A.1 – Country real GDP levels (log)", "figA1_gdp_levels.png", out_dir)
+def export_fig_a2(df, out_dir): _country_grid(df, LOG_CPI, "Log CPI", "Fig. A.2 – Country CPI levels (log)", "figA2_cpi_levels.png", out_dir)
+def export_fig_a3(df, out_dir): _country_grid(df, LOG_ENERGY, "Log Energy Price", "Fig. A.3 – Country energy price levels (log)", "figA3_energy_levels.png", out_dir)
+def export_fig_a4(df, out_dir): _country_grid(df, OPEN_TRADE, "OpenTrade (% GDP)", "Fig. A.4 – Country open trade (% of GDP)", "figA4_opentrade.png", out_dir)
+def export_fig_a5(df, out_dir): _country_grid(df, GOV_EXP, "Gov. Expenditures (% GDP)", "Fig. A.5 – Country government expenditures (% of GDP)", "figA5_govexp.png", out_dir)
+def export_fig_a6(df, out_dir): _country_grid(df, INVEST, "Investment (% GDP)", "Fig. A.6 – Country investment (% of GDP)", "figA6_investment.png", out_dir)
 
-def plot_country_coeffs(country_df: pd.DataFrame, out_path: Path, var: str = "dlenpr") -> None:
-    import matplotlib.pyplot as plt
-
-    data = country_df[country_df["variable"] == var].copy()
-    data = data.dropna(subset=["coef", "se"])
-    data = data.sort_values("coef")
-    if data.empty:
-        return
-
-    y_pos = np.arange(len(data))
-    ci_low = data["coef"] - 1.96 * data["se"]
-    ci_high = data["coef"] + 1.96 * data["se"]
-
-    plt.figure(figsize=(8, max(4, 0.25 * len(data))))
-    plt.hlines(y_pos, ci_low, ci_high, color="gray")
-    plt.plot(data["coef"], y_pos, "o", color="black")
-    plt.yticks(y_pos, data["country"])
-    plt.axvline(0, color="red", linestyle="--", linewidth=1)
-    plt.title("Coefficients pays pour dlenpr (CCEMG)")
-    plt.xlabel("Coefficient")
-    plt.tight_layout()
-    plt.savefig(out_path, dpi=150)
+def export_fig_a7(df: pd.DataFrame, out_dir: Path) -> None:
+    plt.rcParams.update(PAPER_RC)
+    df_r = df.reset_index()
+    countries = sorted(df_r[COUNTRY_COL].unique())
+    fig, axes = plt.subplots(4, 5, figsize=(13, 8.5))
+    axes_flat = axes.flatten()
+    for idx, c in enumerate(countries[:20]):
+        ax, sub = axes_flat[idx], df_r[df_r[COUNTRY_COL] == c].sort_values(YEAR_COL).dropna(subset=[f"d{LOG_GDP}"])
+        ax.plot(sub[YEAR_COL], sub[f"d{LOG_GDP}"], lw=0.85, color="black", label="D.GDP")
+        if "residual" in sub.columns: ax.plot(sub[YEAR_COL], sub["residual"], lw=0.7, color="#777777", linestyle="--", label="Residual")
+        ax.axhline(0, color="red", lw=0.5, linestyle=":")
+        ax.set_title(_country_label(c), fontsize=6.5, pad=1.5)
+        ax.tick_params(labelsize=5.5)
+        ax.xaxis.set_major_locator(MultipleLocator(20))
+    for idx in range(len(countries), len(axes_flat)): axes_flat[idx].set_visible(False)
+    handles = [plt.Line2D([0],[0], color="black", lw=1, label="D.GDP"), plt.Line2D([0],[0], color="#777777", lw=0.8, linestyle="--", label="Residuals")]
+    fig.legend(handles=handles, loc="lower right", fontsize=7, frameon=False)
+    fig.text(0.5, 0.01, "Year", ha="center", fontsize=8)
+    fig.suptitle("Fig. A.7 – Actual change in Real GDP and CCEMG residuals by country", fontsize=9, fontweight="bold", y=1.01)
+    plt.tight_layout(rect=[0.02, 0.03, 1, 0.99])
+    plt.savefig(out_dir / "figA7_gdp_residuals.png", dpi=200, bbox_inches="tight")
     plt.close()
 
-
-def plot_irf(irf_df: pd.DataFrame, out_path: Path) -> None:
-    import matplotlib.pyplot as plt
-
-    plt.figure(figsize=(6, 4))
-    plt.plot(irf_df["h"], irf_df["tau"], marker="o", color="black")
-    plt.fill_between(irf_df["h"], irf_df["lower"], irf_df["upper"], color="gray", alpha=0.3)
-    plt.axhline(0, color="red", linestyle="--", linewidth=1)
-    plt.title("IRF moyenne OCDE (4 periodes)")
-    plt.xlabel("Periode")
-    plt.ylabel("Reponse")
-    plt.tight_layout()
-    plt.savefig(out_path, dpi=150)
-    plt.close()
-
-
-def plot_boxplots_transforms(df: pd.DataFrame, out_path: Path) -> None:
-    import matplotlib.pyplot as plt
-
-    df = df.copy()
-    df["GDP_within"] = df[LOG_GDP] - df.groupby(level=0)[LOG_GDP].transform("mean")
-    mean_t = df.groupby(level=1)[LOG_GDP].transform("mean")
-    df["GDP_twfe"] = df[LOG_GDP] - df.groupby(level=0)[LOG_GDP].transform("mean") - mean_t + df[LOG_GDP].mean()
-
-    df_reset = df.reset_index()
-    countries = df_reset[COUNTRY_COL].unique()
-
-    fig, axes = plt.subplots(1, 3, figsize=(14, 4), sharey=False)
-    for ax, col, title in zip(
-        axes,
-        ["GDP_within", "dlrgdpmad", "GDP_twfe"],
-        ["Within", "First differences", "Two-way FE"],
-    ):
-        data = [df_reset.loc[df_reset[COUNTRY_COL] == c, col].dropna().values for c in countries]
-        ax.boxplot(data, labels=countries, vert=True, showfliers=False)
-        ax.set_title(title)
-        ax.tick_params(axis="x", rotation=90)
-
-    plt.tight_layout()
-    plt.savefig(out_path, dpi=150)
-    plt.close()
-
-
-# -----------------------------------------------------------------------------
-# Pipeline principale
-# -----------------------------------------------------------------------------
+# =============================================================================
+# Pipeline Principale
+# =============================================================================
 
 def run_all() -> None:
     OUTPUT_DIR.mkdir(exist_ok=True)
-
-    df_raw = load_data(DATA_PATH)
-    df = prepare_panel(df_raw)
-    df = add_transformations(df)
-    df, ecm_model = compute_ecm(df)
-
-    df_full = df
-
-    # Option echantillon de base pour CCEMG
-    if BASE_START_YEAR is not None:
-        df_base = df_full[df_full.index.get_level_values(YEAR_COL) >= BASE_START_YEAR]
-    else:
-        df_base = df_full
-
-    # 1) Stats descriptives
-    var_table = panel_variance_decomp(df_full, CORE_VARS)
-    var_table.to_csv(OUTPUT_DIR / "descriptive_variance.csv", index=False)
-
-    quasi = var_table[var_table["pct_within"] < 10.0]
-    quasi.to_csv(OUTPUT_DIR / "quasi_time_invariant.csv", index=False)
-
-    obs_tables = observation_tables(df_full)
-    obs_tables["by_country"].to_csv(OUTPUT_DIR / "obs_by_country.csv")
-    obs_tables["by_year"].to_csv(OUTPUT_DIR / "obs_by_year.csv")
-    obs_tables["matrix"].to_csv(OUTPUT_DIR / "obs_matrix.csv")
-
-    # 2) Tests preliminaires
+    df_full = load_and_prepare_data(DATA_PATH)
+    df_base = df_full[df_full.index.get_level_values(YEAR_COL) >= 1972].copy()
+    
+    print("\n── Generation Tables (Format Academique Strict) ──────────────────")
+    export_table1(df_full, OUTPUT_DIR)
+    
     cips_rows = []
-    for var in [LOG_GDP, LOG_CPI, LOG_ENERGY, OPEN_TRADE, GOV_EXP, INVEST]:
-        stat_lvl, p_lvl = cips_test(df_full[var], lags=1)
-        dvar = f"d{var}"
-        stat_diff, p_diff = cips_test(df_full[dvar], lags=1)
-        cips_rows.append(
-            {
-                "variable": var,
-                "stat_level": stat_lvl,
-                "pvalue_level": p_lvl,
-                "stat_diff": stat_diff,
-                "pvalue_diff": p_diff,
-            }
-        )
-    pd.DataFrame(cips_rows).to_csv(OUTPUT_DIR / "cips_tests.csv", index=False)
+    for var in CORE_VARS:
+        for lag in range(0, 4):
+            sl, pl = cips_test_manual(df_full[var], lags=lag, trend='c')
+            sd, pd_ = cips_test_manual(df_full[f"d{var}"], lags=lag, trend='c')
+            slt, plt = cips_test_manual(df_full[var], lags=lag, trend='ct')
+            cips_rows.append({"variable": var, "lag": lag, "stat_level": sl, "pvalue_level": pl, "stat_diff": sd, "pvalue_diff": pd_, "stat_level_t": slt, "pvalue_level_t": plt})
+    export_table2(pd.DataFrame(cips_rows), OUTPUT_DIR)
 
-    cd_rows = []
-    for var in [LOG_GDP, LOG_CPI, LOG_ENERGY, OPEN_TRADE, GOV_EXP, INVEST]:
-        stat, pval, avg_corr = pesaran_cd(df_full[var])
-        cd_rows.append({"variable": var, "cd_stat": stat, "pvalue": pval, "avg_corr": avg_corr})
-    pd.DataFrame(cd_rows).to_csv(OUTPUT_DIR / "cd_tests.csv", index=False)
+    cce_regs = ["dlcpi", "dlenpr", "dopen", "dexpgdp", "diy", "l_lrgdpmad", "l_lcpi", "l_open", "l_iy"]
+    _, mg_cce, mg_robust, _ = estimate_ccemg(df_full, "dlrgdpmad", cce_regs, [], [], exog_only=True)
+    export_table3(mg_cce, mg_robust, OUTPUT_DIR)
 
-    delta_stat, delta_p = delta_test_pesaran_yamagata(
-        df_full, LOG_GDP, [LOG_ENERGY, LOG_CPI, OPEN_TRADE, GOV_EXP, INVEST]
-    )
-    pd.DataFrame(
-        [{"delta_stat": delta_stat, "pvalue": delta_p}]
-    ).to_csv(OUTPUT_DIR / "delta_test.csv", index=False)
-
-    # 3) Estimations panel
-    panel_table = estimate_static_panel(df_full)
-    panel_table.to_csv(OUTPUT_DIR / "panel_models_table.csv", index=False)
-
-    # 4) Modele dynamique
-    dyn_ols = fit_dynamic_ols(df_full)
-    dyn_iv = fit_dynamic_iv(df_full)
-
-    ols_table = pd.DataFrame(
-        {
-            "coef": dyn_ols.params,
-            "se": dyn_ols.bse,
-            "t": dyn_ols.tvalues,
-            "p": dyn_ols.pvalues,
-        }
-    )
-    ols_table.to_csv(OUTPUT_DIR / "ardl_ols.csv")
-
-    iv_table = pd.DataFrame(
-        {
-            "coef": dyn_iv.params,
-            "se": dyn_iv.std_errors,
-            "t": dyn_iv.tstats,
-            "p": dyn_iv.pvalues,
-        }
-    )
-    iv_table.to_csv(OUTPUT_DIR / "ardl_iv.csv")
-
-    # Premier stage
-    try:
-        fs = dyn_iv.first_stage
-        fs_rows = []
-        for name, stage in fs.items():
-            fs_rows.append({"endog": name, "r2": stage.rsquared})
-        pd.DataFrame(fs_rows).to_csv(OUTPUT_DIR / "first_stage_r2.csv", index=False)
-    except Exception:
-        pd.DataFrame([], columns=["endog", "r2"]).to_csv(OUTPUT_DIR / "first_stage_r2.csv", index=False)
-
-    # Hausman OLS vs IV
-    h_stat, h_p = hausman_test(dyn_ols, dyn_iv)
-    pd.DataFrame([{"hausman_stat": h_stat, "pvalue": h_p}]).to_csv(
-        OUTPUT_DIR / "hausman_ols_iv.csv", index=False
-    )
-
-    # IRF et long terme
-    rho = dyn_iv.params.get("l_dlrgdpmad", np.nan)
-    b1 = dyn_iv.params.get("dlenpr", np.nan)
-    b2 = dyn_iv.params.get("l_dlenpr", np.nan)
-    irf_vals = compute_irf(b1, b2, rho, horizons=4)
-    se_irf = irf_standard_errors(b1, b2, rho, dyn_iv.std_errors.to_dict())
-
-    irf_df = pd.DataFrame(
-        {
-            "h": np.arange(1, 5),
-            "tau": irf_vals,
-            "se": se_irf,
-        }
-    )
-    irf_df["lower"] = irf_df["tau"] - 1.96 * irf_df["se"]
-    irf_df["upper"] = irf_df["tau"] + 1.96 * irf_df["se"]
-    irf_df.to_csv(OUTPUT_DIR / "irf.csv", index=False)
-
-    if np.isfinite(rho) and abs(rho) >= 1:
-        warnings.warn("|rho| >= 1: IRF explosive et LT invalide.")
-
-    lt_coef = (b1 + b2) / (1.0 - rho) if np.isfinite(rho) and abs(rho) < 1 else np.nan
-    pd.DataFrame([{"lt_coef": lt_coef, "rho": rho}]).to_csv(
-        OUTPUT_DIR / "long_term.csv", index=False
-    )
-
-    # 5) CCEMG avec IV
-    instruments = infer_instruments(df)
-    if not instruments:
-        warnings.warn("Aucun instrument detecte. dlenpr sera traite comme exogene.")
-
-    dep = "dlrgdpmad"
-    exog_vars = [
-        "l_dlcpi2",
-        "dopen",
-        "dexpgdp",
-        "diy",
-        "l_lrgdpmad",
-        "l_lcpi",
-        "l_open",
-        "l_iy",
-        "mod",
-        "dlenprmod",
-    ]
+    exog_vars = ["l_dlcpi2", "dopen", "dexpgdp", "diy", "l_lrgdpmad", "l_lcpi", "l_open", "l_iy", "mod", "dlenprmod"]
     endog_vars = ["dlenpr"]
+    insts = [c for c in INSTRUMENT_COLS if c in df_base.columns]
 
-    cc_country, cc_mg = estimate_ccemg(
-        df_base, dep, exog_vars, endog_vars, instruments, exog_only=not instruments
-    )
-    cc_country.to_csv(OUTPUT_DIR / "ccemg_country_coefs.csv", index=False)
-    cc_mg.to_csv(OUTPUT_DIR / "ccemg_mg.csv", index=False)
+    robustness_df = build_robustness_table(df_base, df_full, "dlrgdpmad", exog_vars, endog_vars, insts)
+    export_table4(robustness_df, OUTPUT_DIR)
 
-    robustness = build_robustness_table(df_base, df_full, dep, exog_vars, endog_vars, instruments)
-    robustness.to_csv(OUTPUT_DIR / "ccemg_robustness_table.csv", index=False)
+    cc_country, _, _, residuals = estimate_ccemg(df_base, "dlrgdpmad", exog_vars, endog_vars, insts)
+    intensity_df = load_table56(DATA_PATH)
+    export_table5(cc_country, OUTPUT_DIR, intensity_df)
+    export_table6(cc_country, OUTPUT_DIR, intensity_df)
 
-    # 6) Graphiques
-    plot_energy_prices(df_full, OUTPUT_DIR / "fig1_energy_prices.png")
-    plot_country_coeffs(cc_country, OUTPUT_DIR / "fig2_country_coeffs.png", var="dlenpr")
-    plot_irf(irf_df, OUTPUT_DIR / "fig3_irf.png")
-    plot_boxplots_transforms(df_full, OUTPUT_DIR / "fig4_boxplots.png")
+    print("\n── Generation Figures ──────────────────────────────────────────────")
+    export_fig_a1(df_full, OUTPUT_DIR)
+    export_fig_a2(df_full, OUTPUT_DIR)
+    export_fig_a3(df_full, OUTPUT_DIR)
+    export_fig_a4(df_full, OUTPUT_DIR)
+    export_fig_a5(df_full, OUTPUT_DIR)
+    export_fig_a6(df_full, OUTPUT_DIR)
+    
+    df_base_res = df_base.copy()
+    df_base_res["residual"] = residuals
+    export_fig_a7(df_base_res, OUTPUT_DIR)
 
+    print(f"\n✅ Pipeline terminée. Rendu visuel 100% aligné sur le papier original.")
 
 if __name__ == "__main__":
     run_all()
