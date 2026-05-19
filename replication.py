@@ -1,10 +1,7 @@
 """
-Auteur : A COMPLETER
-Date   : 2026-05-19
 Reference : Huntington & Liddle (2022), "How energy prices shape OECD economic growth",
             Energy Economics, 111, 106082.
 
-Mise à jour : Alignement strict sur la mise en page originale des Tables 1, 4, 5 et 6.
 """
 
 from __future__ import annotations
