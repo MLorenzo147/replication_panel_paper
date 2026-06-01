@@ -3,8 +3,7 @@
 ## *How Energy Prices Shape OECD Economic Growth: Panel Evidence from Multiple Decades*
 
 > **Cours** : Économétrie avancée — Données de panel (Master 2)  
-> **Université** : Université Paris 1 Panthéon-Sorbonne  
-> **Auteur** : *[Nom de l'auteur]*  
+> **Université** : Université Paris 1 Panthéon-Sorbonne    
 > **Date** : Juin 2026
 
 ---
